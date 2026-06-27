@@ -26,6 +26,7 @@ export class SubAgentRunner {
     config: {
       maxIterations: number;
       signal?: AbortSignal;
+      cwd?: string;
     },
   ): Promise<SubAgentResult> {
     const taskId = randomBytes(4).toString('hex');
@@ -116,7 +117,7 @@ export class SubAgentRunner {
             result = await tool.execute(
               block.tool_input as Record<string, unknown>,
               {
-                cwd: process.cwd(),
+                cwd: config.cwd ?? process.cwd(),
                 timeout: 30000,
                 signal: config.signal,
               },

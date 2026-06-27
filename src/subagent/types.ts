@@ -16,6 +16,7 @@ export interface AgentRoleFrontmatter {
   model?: string;
   max_iterations?: number;
   permission_mode?: 'strict' | 'default' | 'permissive';
+  isolation?: string;
 }
 
 /** 完整角色定义 */
@@ -27,6 +28,7 @@ export interface AgentRole {
   model: string;
   max_iterations: number;
   permission_mode: 'strict' | 'default' | 'permissive';
+  isolation: 'none' | 'worktree';
   /** Markdown 正文 = 子 Agent 的系统提示 */
   body: string;
   source: RoleSource;

@@ -13,6 +13,7 @@ import type { AgentToolInput } from './types.js';
 import { RoleLoader } from './role_loader.js';
 import { SubAgentRunner } from './runner.js';
 import { TaskManager } from './task_manager.js';
+import { WorktreeManager } from '../worktree/worktree_manager.js';
 
 /** 工具过滤：永远禁止传给子 Agent 的工具 */
 const GLOBAL_BLOCKED = ['agent'];
@@ -50,6 +51,11 @@ export class AgentTool implements Tool {
         type: 'boolean',
         description: '是否后台执行（type=fork 时强制后台）',
       },
+      isolation: {
+        type: 'string',
+        enum: ['none', 'worktree'],
+        description: '文件隔离模式。worktree=独立Git工作目录，不污染主工作区',
+      },
     },
     required: ['type', 'prompt'],
   };
@@ -59,6 +65,7 @@ export class AgentTool implements Tool {
   private taskManager: TaskManager;
   private getParentMessages: () => Message[];
   private getMainToolRegistry: () => ToolRegistry;
+  private worktreeManager: WorktreeManager | null = null;
 
   constructor(
     roleLoader: RoleLoader,
@@ -74,11 +81,15 @@ export class AgentTool implements Tool {
     this.getMainToolRegistry = getMainToolRegistry;
   }
 
+  setWorktreeManager(wm: WorktreeManager): void {
+    this.worktreeManager = wm;
+  }
+
   async execute(
     input: Record<string, unknown>,
     _context: ToolExecuteContext,
   ): Promise<ToolResult> {
-    const { type, name, prompt, background } = input as unknown as AgentToolInput;
+    const { type, name, prompt, background, isolation: isoParam } = input as unknown as AgentToolInput & { isolation?: string };
 
     if (!prompt) {
       return { success: false, output: '缺少必填参数: prompt', meta: { tool: 'agent' } };
@@ -88,8 +99,31 @@ export class AgentTool implements Tool {
       return { success: false, output: 'type=defined 时缺少必填参数: name', meta: { tool: 'agent' } };
     }
 
+    // 确定是否启用 worktree 隔离（工具参数优先于角色定义）
+    const wantIsolation = isoParam === 'worktree';
+
     try {
       let messages: Message[];
+      let worktreePath: string | undefined;
+      let worktreeName: string | undefined;
+
+      // 创建 worktree（defined 和 fork 都支持）
+      if (wantIsolation && this.worktreeManager) {
+        try {
+          const wtName = name
+            ? `sub-${name}`
+            : `sub-fork-${Math.random().toString(36).slice(2, 8)}`;
+          const wt = await this.worktreeManager.create({
+            taskId: Math.random().toString(36).slice(2, 10),
+            name: wtName,
+          });
+          worktreePath = wt.path;
+          worktreeName = wtName;
+          process.stderr.write(`[agent] Worktree 已就绪: ${worktreePath}\n`);
+        } catch (err) {
+          process.stderr.write(`[agent] Worktree 创建失败，回退: ${(err as Error).message}\n`);
+        }
+      }
       let parentTools: ToolDefinition[];
 
       if (type === 'defined') {
@@ -106,8 +140,13 @@ export class AgentTool implements Tool {
         }
 
         // 空白上下文 + 角色系统提示
+        let systemBody = role.body;
+        if (worktreePath) {
+          systemBody += `\n\n[工作目录]\n你的工作目录是: ${worktreePath}\n所有文件操作请在此目录下进行。`;
+        }
+
         messages = [
-          { role: 'system' as const, content: role.body },
+          { role: 'system' as const, content: systemBody },
           { role: 'user' as const, content: prompt },
         ];
 
@@ -123,7 +162,7 @@ export class AgentTool implements Tool {
 
         if (isBackground) {
           const taskId = await this.runBackground(messages, filteredToolDefs, subToolRegistry, {
-            maxIterations: maxIters, roleName: role.name, prompt,
+            maxIterations: maxIters, roleName: role.name, prompt, cwd: worktreePath,
           });
           return {
             success: true,
@@ -135,9 +174,15 @@ export class AgentTool implements Tool {
         process.stderr.write(`[agent] 启动子 Agent "${role.name}", 最多 ${maxIters} 轮...\n`);
         const result = await this.runner.run(messages, filteredToolDefs, subToolRegistry, {
           maxIterations: maxIters,
+          cwd: worktreePath,
         });
         result.roleName = role.name;
         process.stderr.write(`[agent] 子 Agent "${role.name}" 完成 (${result.turns}轮, ${result.durationMs}ms)\n`);
+
+        // 清理 worktree（同步模式，如有变更则保留；后台模式跳过）
+        if (!isBackground && worktreeName && this.worktreeManager) {
+          this.worktreeManager.exit(worktreeName).catch(() => {});
+        }
 
         return {
           success: true,
@@ -146,8 +191,11 @@ export class AgentTool implements Tool {
         };
       } else {
         // Fork 式：继承父对话 + 强制后台
-        const parentMsgs = this.getParentMessages();
-        messages = [...parentMsgs, { role: 'user' as const, content: prompt }];
+        const parentMsgs = this.filterCompleteMessages(this.getParentMessages());
+        const forkPrompt = worktreePath
+          ? `[工作目录: ${worktreePath}]\n\n${prompt}`
+          : prompt;
+        messages = [...parentMsgs, { role: 'user' as const, content: forkPrompt }];
 
         const subToolRegistryFork = this.buildFilteredRegistry(undefined, undefined);
         const filteredToolDefsFork = subToolRegistryFork.getAll().map((t) => ({
@@ -155,7 +203,7 @@ export class AgentTool implements Tool {
         }));
 
         const taskId = await this.runBackground(messages, filteredToolDefsFork, subToolRegistryFork, {
-          maxIterations: 15, roleName: 'fork', prompt,
+          maxIterations: 15, roleName: 'fork', prompt, cwd: worktreePath,
         });
 
         return {
@@ -196,7 +244,7 @@ export class AgentTool implements Tool {
     messages: Message[],
     tools: ToolDefinition[],
     toolRegistry: ToolRegistry,
-    opts: { maxIterations: number; roleName?: string; prompt: string },
+    opts: { maxIterations: number; roleName?: string; prompt: string; cwd?: string },
   ): Promise<string> {
     const taskId = Math.random().toString(36).slice(2, 10);
 
@@ -214,6 +262,7 @@ export class AgentTool implements Tool {
       try {
         const result = await this.runner.run(messages, tools, toolRegistry, {
           maxIterations: opts.maxIterations,
+          cwd: opts.cwd,
         });
         result.roleName = opts.roleName;
         result.taskId = taskId;
@@ -224,6 +273,47 @@ export class AgentTool implements Tool {
     });
 
     return taskId;
+  }
+
+  /** 过滤不完整的 tool_calls（保证 assistant tool_calls 后跟 tool result） */
+  private filterCompleteMessages(msgs: Message[]): Message[] {
+    const result: Message[] = [];
+    const pendingToolIds = new Set<string>();
+
+    for (const msg of msgs) {
+      if (msg.role === 'assistant' && typeof msg.content !== 'string') {
+        const blocks = msg.content as any[];
+        const toolCalls = blocks.filter((b: any) => b.type === 'tool_use');
+        for (const tc of toolCalls) {
+          if (tc.tool_use_id) pendingToolIds.add(tc.tool_use_id);
+        }
+        result.push(msg);
+      } else if (msg.role === 'tool' && typeof msg.content !== 'string') {
+        const blocks = msg.content as any[];
+        for (const b of blocks) {
+          if (b.tool_use_id) pendingToolIds.delete(b.tool_use_id);
+        }
+        result.push(msg);
+      } else {
+        result.push(msg);
+      }
+    }
+
+    // 移除最后一条 assistant 消息中未配对的 tool_use
+    const last = result[result.length - 1];
+    if (last?.role === 'assistant' && typeof last.content !== 'string') {
+      const blocks = (last.content as any[]).filter((b: any) => {
+        if (b.type !== 'tool_use') return true;
+        return b.tool_use_id && !pendingToolIds.has(b.tool_use_id);
+      });
+      if (blocks.length === 0) {
+        result.pop();
+      } else {
+        result[result.length - 1] = { ...last, content: blocks };
+      }
+    }
+
+    return result;
   }
 
   /** 格式化结果 */

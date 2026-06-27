@@ -36,6 +36,7 @@ import { RoleLoader } from './subagent/role_loader.js';
 import { SubAgentRunner } from './subagent/runner.js';
 import { TaskManager } from './subagent/task_manager.js';
 import { AgentTool } from './subagent/agent_tool.js';
+import { WorktreeManager } from './worktree/worktree_manager.js';
 
 // ANSI 转义码
 const RESET = '\x1b[0m';
@@ -177,6 +178,13 @@ async function main() {
     () => chatManager.getMessages(),
     () => registry,
   );
+
+  // Worktree 隔离
+  const worktreeManager = new WorktreeManager(process.cwd());
+  agentTool.setWorktreeManager(worktreeManager);
+  // 启动时异步清理过期 worktree
+  worktreeManager.cleanExpired(7).catch(() => {});
+
   registry.register(agentTool);
 
   // 2.7. 权限系统（readline 创建后再注入确认回调）

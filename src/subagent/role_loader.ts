@@ -106,6 +106,7 @@ export class RoleLoader {
       model: fm.model ?? 'inherit',
       max_iterations: fm.max_iterations ?? 10,
       permission_mode: fm.permission_mode ?? 'default',
+      isolation: (fm.isolation === 'worktree' ? 'worktree' : 'none'),
       body,
       source,
       filePath,
